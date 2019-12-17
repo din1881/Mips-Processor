@@ -1,0 +1,618 @@
+`timescale 10ns/10ps //REACH 10ns WITH A STEP OF 10ps
+
+/* This module is specific for branch equal instruction (Beq) to set the next address of PC 
+   by (Current PC Address + 4) + (SIGN_EXTENSION_OUTPUT Shift lefted by 2) 
+ */
+ 
+module Adder(output [12:0] result,input [12:0] in1,input [12:0] in2);
+assign result = in1 + in2;
+endmodule
+
+
+/*********************************************ALU Module************************************************/
+
+/*THE ALU MODULE TAKES ITS INPUT FROM THE ALU CONTROL, shamt (ori support), INPUT ONE FROM READ DATA ONE AND INPUT 2 CAN VARRYAS WE WILL SEE,
+
+ THE ALU IS ALSO A SYNCRONOUS MODULE SO THE CLK PLAYS AN IMPORTANT ROLE IN THE DESIGN, WHERE THE INPUT IS CHANGED EACH CLK CYCLE
+
+A ZERO FLAG IS PRESENT TO AID IN THE IMPLEMENTATION OF BEQ,...*/
+
+module ALU(shamt,input1,input2, Aluctl, Aluout, zflag);
+input [31:0] input1,input2; //input 1 is the result of read data 1 //input 2 comes from a mux where two inputs are read data 2 and sign extention result and selection phase from control unit ALUsrc
+input [3:0] Aluctl;//this input from alu ctl is to tell the alu what operation shall be performed
+input [4:0] shamt; //shift amount 
+
+
+output reg [31:0] Aluout; //output of alu operation
+output zflag; //output aids in beq implementation
+
+assign zflag = (Aluout == 0); // ZFLAG IS INITIALLY ASSIGNED ZERO AND IF THE 2 REGS ARE NOT EQUAL, ALUOUT WILLBE ASSIGNED TO 1
+
+always @ (*)
+begin
+case(Aluctl) //WHEN ALUCTL SIGNAL CHANGES THE ALUOUT IS ASSIGNED BY THE OPERATION DONE
+0: Aluout <= input1 & input2 ;
+1: Aluout <= input1 | input2 ;
+2: Aluout <= input1 + input2 ;
+3: Aluout <= input1 << shamt;
+4: 
+begin //to support ori we take second input shift left it by 16 bits then shift right again by 16 bits to make the 16 leftmost bits by zero to get correct results in ori
+Aluout <= input2 << 16;
+Aluout <= Aluout >> 16;
+end
+6: Aluout <= input1 - input2 ; //SUBTRACTION
+7: Aluout <= input1 < input2 ? 1:0 ; //in case of stl
+12: Aluout <= ~(input1 | input2) ; // nor
+// Default operation 
+default: Aluout <= 0 ;
+endcase
+end
+endmodule
+
+
+
+/********************************************ALU_Control Module****************************************/
+
+/* The ALU CONTROL module is reponsiple for generating the aluctl as an output, which is directed to the alu to tell 
+
+it which ooperation must be done, the alu control takes the fucfield(from the instructon) and the aluop(from control unit) as inputs 
+*/
+
+module ALU_control(funcField, Aluop, Aluctl);
+
+input [5:0] funcField; // first  6 bits of any instruction
+input [1:0] Aluop; //control unit signal, we assigned only 2 bits as they are enough to support basic operation
+
+output reg [3:0] Aluctl; // alu ctl is 4 bits to support the instructions
+
+
+always @ (funcField or Aluop) //enters loop if any of funcfield or aluop is changed
+begin
+if( Aluop == 2'b00) //add operation
+begin
+Aluctl <= 4'b0010;
+end
+else if ( Aluop == 2'b01 ) //subtract operation
+begin
+Aluctl <= 4'b0110;
+end
+else if ( Aluop == 2'b10 ) // determined by the operation encoded in the functionn field
+begin
+case(funcField)
+/*SLL Inst*/
+0:  Aluctl <= 4'b0011;
+/*AND Inst*/
+36: Aluctl <= 4'b0000;
+/*OR Inst*/
+37: Aluctl <= 4'b0001;
+/*ADD Inst*/
+32: Aluctl <= 4'b0010;
+/*SUB Inst*/
+34: Aluctl <= 4'b0110;
+/*SLT Inst*/
+42: Aluctl <= 4'b0111;
+/*NOR Inst*/
+39: Aluctl <= 4'b1100;
+default : Aluctl <= 4'b0000;
+endcase
+end
+/* ORI instruction*/
+else if (Aluop == 2'b11)
+begin
+Aluctl <= 4'b0100;
+end
+else
+Aluctl <= 4'bxxxx;
+end
+
+endmodule
+
+
+
+
+ /********************************CLOCK_generation Module**************************************/
+module CLOCK_generation(clock);
+output reg clock;
+/*initial 
+begin 
+clock <= 0 ; 
+end 
+*/
+always 
+begin 
+#3.125 clock = 0;
+#3.125 clock = 1;
+end 
+endmodule
+
+
+/*****************************CONTROL UNIT MODULE**************************************/
+
+/*The control unit module is responsible for generating various signals to almost all modules of the mips processor,
+
+the control unit takes the opcode and funcfield as inputs , outputs REGDST, memread, memtoreg, ALUOP, memwrite, ALUSRC,
+
+ regwrite, branch, jump, jump_r, jal, all these signals are vital for the mips processor and the execution overall
+
+REGDST -> it is responsible for controlling a mux to either write in rt or rd registers
+
+memread -> determine whether to read from memory or not to display it
+
+memtoreg -> read mem data or alu result
+
+ALUOP ->signals sent to the alu ctl to detremine the op
+
+memwrite ->write in memory or not
+
+ALUSRC -> controls mux to choses bet read data 2 or sign extension result
+
+regwrite ->write in registers or not
+
+branch -> to be anded with zero flag to aid in implementation of branch instruction
+
+jump -> to  handle jump instruction
+
+jump_r -> to handle jump register instruction
+
+jal -> to control two additional muxes one after memtoreg mux and the other one is after the regdest mux to implement jal
+*/
+
+module CONTROL_unit(opcode,func,REGDST, memread, memtoreg, ALUOP, memwrite, ALUSRC, regwrite, branch, jump, jump_r, jal);
+
+input [5:0] opcode;
+input [5:0] func;
+
+output reg REGDST, memread, memtoreg, memwrite, ALUSRC, regwrite, branch, jump, jump_r, jal;
+output reg [1:0] ALUOP;
+
+always @ (opcode or func)
+	begin
+	
+	//reseting all signals
+
+	REGDST <= 1'b0;
+	memread <= 1'b0;
+	memtoreg <= 1'b0;
+	memwrite <= 1'b0;
+	regwrite <= 1'b0;
+	branch <= 1'b0;
+	ALUSRC <= 1'b0;
+	ALUOP <= 2'b00;
+	jump <= 1'b0;
+	jump_r <= 1'b0;
+	jal <= 1'b0;
+	
+	begin
+
+	//the r-type instructions implementation
+	if(opcode == 6'b000000) 
+		begin
+		/* Jump register instruction*/
+		if(func== 6'b001000)
+			begin
+			jal <= 1'b0;
+			jump_r <= 1'b1;
+			end
+		/* Add,And,Or,SLT,SLL Instructions*/
+		else
+			begin
+			jal <= 1'b0;
+			REGDST <= 1'b1;
+			ALUOP <= 2'b10;
+			regwrite <= 1'b1;
+			end
+		end
+	//addi instruction implemntation
+	else if(opcode == 6'b001000) 
+		begin
+		jal <= 1'b0;
+		REGDST <= 1'b0;
+		memread <= 1'b0;
+		memtoreg <= 1'b0;
+		regwrite <= 1'b1;
+		ALUSRC <= 1'b1;
+		ALUOP <= 2'b00;
+		end
+	
+	//ori instruction implementation
+	else if(opcode == 6'b001101) 
+		begin
+		jal <= 1'b0;
+		REGDST <= 1'b0;
+		memread <= 1'b0;
+		memwrite <= 1'b0;
+		memtoreg <= 1'b0;
+		regwrite <= 1'b1;
+		ALUSRC <= 1'b1;
+		ALUOP <= 2'b11;
+		end
+
+	//lw instruction implementation
+	else if(opcode == 6'b100011) 
+		begin
+		jal <= 1'b0;
+		REGDST <= 1'b0;
+		memread <= 1'b1;
+		memtoreg <= 1'b1;
+		memwrite <= 1'b0;
+		regwrite <= 1'b1;
+		branch <= 1'b0;
+		ALUSRC <= 1'b1;
+		ALUOP <= 2'b00;
+		end
+
+	//sw instruction implementation
+	else if(opcode == 6'b101011) 
+		begin
+		jal <= 1'b0;
+		memread <= 1'b0;
+		memwrite <= 1'b1;
+		regwrite <= 1'b0;
+		branch <= 1'b0;
+		ALUSRC <= 1'b1;
+		ALUOP <= 2'b00;
+		end
+
+	//beq instruction implementation
+	else if(opcode == 6'b000100) 
+		begin
+		jal <= 1'b0;
+		memread <= 1'b0;
+		memwrite <= 1'b0;
+		regwrite <= 1'b0;
+		branch <= 1'b1;
+		ALUSRC <= 1'b0;
+		ALUOP <= 2'b01;
+		end
+	
+
+
+	// jump implementation
+	else if(opcode == 6'b000010) 
+		begin
+		jal <= 1'b0;
+		memread <= 1'b0;
+		memwrite <= 1'b0;
+		regwrite <= 1'b0;
+		branch <= 1'b0;
+		ALUSRC <= 1'b0;
+		ALUOP <= 2'b01;
+		jump <= 1'b1;
+		end
+
+	//JAL implementation
+	else if(opcode == 6'b000011)
+		begin
+		jal <= 1'b1;		
+		jump <= 1'b1; 		
+		memread <= 1'b0;
+		memwrite <= 1'b0;
+		memtoreg <= 1'b0;
+		regwrite <= 1'b1;
+		end	
+
+
+	end
+	end
+endmodule
+
+
+
+/*****************************************Data Memory Module******************************************/
+
+/* Data_memory module takes multiple inputs (address, data, control unit signals and CLOCK), 1-output
+   18-bit address field which results from ALU_OUTPUT to specifiy which place in memory to 
+   read/write from/in as the program memory is 32K-Byte 
+
+   32-bit data field which results from Register file direct to the program memory if we want to write
+
+   1-bit CLOCK signal to synchronize the program memory
+
+   2 1-bit control unit singals to control reading/writting from/to memory
+
+   32-bit Data_output 
+*/
+
+module DATA_memory(Read_data,Address,MemWrite,MemRead,Write_data,Clk);
+input Clk,MemWrite,MemRead;
+input [12:0] Address;
+input [31:0] Write_data;
+output reg [31:0] Read_data;
+reg [31:0] R_F[0:8191];
+/*
+integer i;
+initial
+begin
+for(i=0;i<8191;i=i+1)
+	RF[i] = 0;
+end
+*/
+always@ (*)
+begin
+Read_data <= (MemRead == 1) ? R_F[Address] : 32'h00000000;
+end
+always @(posedge Clk)
+begin
+if(MemWrite)
+	R_F[Address] <= Write_data;
+end
+endmodule
+
+
+/********************************INSTRUCTION_memory Module**************************************/
+
+/* Inst_memory module is a 32K Byte memory, takes the program counter (PC) as an input to determine which 
+   instruction is going to be fetched and then outputs the instruction machine code on a 32-bit register
+
+   Inst_memory is synchronized by a 1-bit CLOCK signal
+*/
+
+module INSTRUCTION_memory (CLK ,PC , instruction, mips, en);
+input wire CLK,en;
+input [12:0] PC ; 
+input wire[31:0] mips;
+output reg [31:0] instruction ; // word in instruction is 32 bit 
+/*
+ * We have 32KB instruction memory 
+ * and 4 byte for each instruction 
+ * So We will have (2^13) instruction == 8192  [8191:0]
+*/
+reg [31:0] instruction_array [0:8191]; 
+/*
+ * When the PC changes 
+ * Then We will Fetch the Next Instruction from The INSTRUCTION_Memory
+*/
+always @(posedge CLK)
+begin
+if(en)
+	instruction_array[PC] <= mips;
+	else
+instruction <= instruction_array[PC];
+end
+
+/*
+initial
+begin
+$readmemb("F:/test.txt",instruction_array); // first arguement file txt path of machine code
+//$display("%h %h %h",instruction_array[0],instruction_array[1],instruction_array[2]);
+end
+*/
+endmodule
+
+
+/*Jump instruction handling module*/
+
+module jump_handle(input [6:0] instruction,input [3:0] current_pc,output [12:0] jump_address);
+assign jump_address =  {current_pc,instruction,2'b00}; //jump address is result of concatenation with current pc bits from 12 to 8 , instruction, and adding 2 zeros from the right
+endmodule
+
+
+
+/*A mux that handles 5 bits input to 5 bits output*/
+
+module MUX2to1_5(cntrl,in1,in2,out);
+input cntrl;
+input [4:0] in1,in2;
+output [4:0] out;
+assign out = (cntrl == 1) ? in2 : in1;
+endmodule
+
+
+/*A mux that handles 32 bits inputs to 32 bits output*/
+
+module MUX2to1_32(cntrl,in1,in2,out);
+input cntrl;
+input [31:0] in1,in2;
+output [31:0] out;
+assign out = (cntrl == 1) ? in2 : in1;
+endmodule
+
+
+/*A mux that handles 13 bits input to 13 bits output*/
+
+module MUX2to1_13(cntrl,in1,in2,out);
+input cntrl;
+input [12:0] in1,in2;
+output [12:0] out;
+assign out = (cntrl == 1) ? in2 : in1;
+endmodule
+
+
+/*********************************************PC_Module********************************************/
+
+/* The pc module is responsible for assigning next pc to current pc eac pposedge clock as its synchronous*/
+
+module PC(input [12:0] next_pc,input clk,output reg[12:0] current_pc);
+/*
+initial
+begin
+current_pc <= 0;
+end
+*/
+always @ ( posedge clk)
+begin
+current_pc <= next_pc;
+end
+endmodule
+
+
+/************************************REGISTER_file Module********************************************/
+
+/* The register file module is responsible for reading data from registers and sending it to to other modules in mips,
+
+or writing data in registers, register module is synchronous element that depends on posedge of clock to change outputs
+
+inputs of regfile are:
+
+read reg 1 -> read from rs register
+
+read reg 2 -> result of mux either read from rt or rd
+
+write data -> data to be written in register (32 bits),result of mux that is selected by control unit memtoreg signal (alu result)
+
+write reg -> which will be the register destination
+
+outputs are: read data 1 and read data 2 to be entered in alu
+*/
+
+module REGISTER_file(CLK, reg_write_sig , read_reg1, read_reg2, write_reg, write_data, read_data1, read_data2);
+
+input [31:0] write_data ; 
+input [4:0] read_reg1, read_reg2, write_reg;
+input reg_write_sig, CLK;
+
+output [31:0] read_data1, read_data2;
+reg [31:0]  RF[0:31]; 
+/*
+integer i;
+
+initial
+begin
+for(i=0;i<32;i=i+1)
+	RF[i] = 0;
+end
+*/
+assign read_data1 = RF[read_reg1];
+assign read_data2 = RF[read_reg2];
+
+always  @ (posedge CLK )
+begin
+if(reg_write_sig) // if reg write signal is on , assign write data signal, put this data in the destination register either rt or rd
+	RF[write_reg] <= write_data;
+end
+endmodule
+
+
+/*The sign extension module is responsible for handling negative nnumbers or positive ones 
+entered as 16 bits to 32 bits, where the 16th bit is repeated 16 more bits to get 32 bits*/
+
+module SIGN_extension(input [15:0] in,output reg [31:0] out);
+always @(in)
+begin
+if(in[15] == 1'b0)
+	out <= 32'b00000000000000001111111111111111 & in;
+else if(in[15] == 1'b1)
+	out <= 32'b11111111111111110000000000000000 | in;
+end
+endmodule
+
+
+/**************************************Data_Path Module***************************************/
+
+/* This module represents MIPS single cycle processor data path which includes all modules external wires, 
+   registers, MUXes & modules instances
+*/
+
+module TB();
+
+wire CLK;
+wire [31:0] IR_OUT, DATA_MEMORY_OUT;
+
+CLOCK_generation c(CLK);
+
+MIPS_cpu datapath(CLK, IR_OUT, DATA_MEMORY_OUT );
+
+endmodule 
+
+
+module MIPS_cpu(CLK, IR_OUT, DATA_MEMORY_OUT, mips,en);
+
+input wire[31:0] mips;
+input wire en;
+/* Register file wires*/
+wire [4:0] write_reg, write_reg2;
+wire [31:0] write_data_reg, read_data1, read_data2;
+
+/* ALU & ALU_Control wires*/
+wire [3:0] Aluctl;
+wire [31:0] ALU_in2, ALU_result;
+
+wire [31:0] memtoreg_output1, SIGN_extended, Mem_Read_data; 
+
+/* Jump instruction related wires*/
+wire [12:0] Jump_out, Jump_address, jump_branch_select;
+
+/* Program counter wires*/
+wire [12:0] current_pc, next_pc, Adder_result;
+
+/*Instruction register wire */
+wire [31:0] IR;
+
+/* Outputs of control Unit */
+wire RegDst;
+wire Branch;
+wire jal;
+wire [1:0] ALUop;
+
+/* assign wire pc + 4 in 13-bit to avoid data over flow and warnings */
+wire [12:0] current_pc_plus_4 = current_pc + 4; 
+
+input wire CLK;
+output reg [31:0] IR_OUT, DATA_MEMORY_OUT;
+
+always@(posedge CLK)
+begin
+ IR_OUT <= IR; 
+ DATA_MEMORY_OUT <= read_data2;
+end
+
+
+//reg [31:0] RF [0:31];
+
+/* Modules Instances are arranged according to data_flow paths*/
+
+PC program_counter(next_pc,CLK,current_pc);
+
+INSTRUCTION_memory I_memory(CLK, current_pc, IR, mips, en);
+
+REGISTER_file R_file(CLK, RegWrite, IR_OUT[25:21], IR_OUT[20:16], write_reg2, write_data_reg, read_data1, read_data2);
+
+CONTROL_unit control_u(IR[31:26],IR[5:0],RegDst, MemRead, MemtoReg, ALUop, MemWrite, ALUSrc, RegWrite, Branch, Jump,Jump_r,jal);
+
+SIGN_extension ext(IR[15:0],SIGN_extended);
+
+Adder add(Adder_result,IR[12:0] << 2,current_pc_plus_4);
+
+ALU_control alu_c(IR[5:0], ALUop, Aluctl);
+
+ALU alu(IR[10:6],read_data1,ALU_in2, Aluctl, ALU_result, zflag);
+
+DATA_memory mem(Mem_Read_data,ALU_result[12:0],MemWrite,MemRead,DATA_MEMORY_OUT,CLK);
+
+jump_handle jump_h(IR_OUT[6:0],current_pc[12:9],Jump_address);
+
+and beq(PCSrc,Branch,zflag);
+
+/* MUXes Instances for data_path controlling */
+
+MUX2to1_5 REG_dst_mux(RegDst,IR[20:16],IR[15:11],write_reg);
+MUX2to1_5 REG_dst_mux2(jal,write_reg, 5'b11111, write_reg2);
+
+MUX2to1_32 ALU_result_mux(ALUSrc,read_data2,SIGN_extended,ALU_in2);
+
+MUX2to1_13 beq_mux(PCSrc,current_pc_plus_4,Adder_result,jump_branch_select);
+
+MUX2to1_32 MemtoReg_mux(MemtoReg,ALU_result,Mem_Read_data,memtoreg_output1);
+MUX2to1_32 MemtoReg_mux2(jal,memtoreg_output1, {19'b0000000000000000000,current_pc_plus_4},write_data_reg);
+
+MUX2to1_13 jump_mux(Jump,jump_branch_select,Jump_address,Jump_out);
+
+MUX2to1_13 next_instruction_mux(Jump_r,Jump_out,read_data1[12:0],next_pc);
+
+
+/* handling output of the code */
+
+/*integer i,file;
+always @ (posedge CLK)
+begin
+if(IR == 32'h0000_0000)
+file = $fopen("F:/out.txt");
+$fmonitor(file,"%h // %d\n",RF[i],RF[i]);
+for(i=0;i<31;i=i+1)
+begin
+#1
+i=i;
+end
+end */
+
+endmodule 
